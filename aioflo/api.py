@@ -117,22 +117,19 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
                 await self._ensure_token()
         raise AssertionError("Unreachable")
 
-    async def _ensure_token(self) -> None:
+    async def _ensure_token(self, *, full_login: bool = False) -> None:
         """Share authentication, including callers arriving mid-refresh."""
-        if self._auth_task is not None and not self._auth_task.done():
-            await asyncio.shield(self._auth_task)
-        elif (
-            not self._token
-            or self._token_rejected
-            or not self._token_expiration
-            or datetime.now() >= self._token_expiration
-        ):
-            _LOGGER.info("Requesting new access token to replace expired one")
-            await self._authenticate_shared()
-
-    async def _authenticate_shared(self, *, full_login: bool = False) -> None:
-        """Run one auth operation; cancelling a waiter does not cancel its peers."""
         if self._auth_task is None or self._auth_task.done():
+            if (
+                not full_login
+                and self._token
+                and not self._token_rejected
+                and self._token_expiration
+                and datetime.now() < self._token_expiration
+            ):
+                return
+            if not full_login:
+                _LOGGER.info("Requesting new access token to replace expired one")
             self._auth_task = asyncio.create_task(self._authenticate(full_login))
             # Retrieve failures even if every waiter has been cancelled.
             self._auth_task.add_done_callback(
@@ -200,7 +197,7 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
 
     async def async_authenticate(self) -> None:
         """Authenticate, sharing any authentication already in progress."""
-        await self._authenticate_shared(full_login=True)
+        await self._ensure_token(full_login=True)
 
     async def _async_authenticate_legacy(self) -> None:
         """Authenticate via the legacy Flo ``users/auth`` flow."""
