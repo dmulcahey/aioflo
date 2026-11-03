@@ -70,6 +70,7 @@ not invented HA pins. No new lint engine or packaging backend is introduced.
 | isort hook | 9.0.1 | unchanged | HA uses Ruff import sorting; no analogous isort pin |
 | isort extra: toml | unpinned | unchanged | No applicable HA pin |
 | mypy hook | v2.3.1 | v2.4.0 | HA test requirements; preserve existing mirror hook mechanism |
+| mypy extras: ast-serialize, librt | resolver-selected (review observed 0.13.1 and 0.16.0) | `ast-serialize==0.12.1`, `librt==0.16.0` in isolated hook | Explicit internal mypy dependency pins in HA test requirements |
 | pre-commit-hooks | v6.0.0 | unchanged | Already matches HA; JSON/YAML/whitespace/branch checks retained |
 | pydocstyle hook | 6.3.0 | unchanged | No applicable HA pin; do not confuse Ruff's pydocstyle rules with this package |
 | shellcheck hook wrapper | gruntwork-io/pre-commit v0.1.30 | unchanged | No HA counterpart; system shellcheck executable was not version-pinned |
@@ -128,10 +129,35 @@ constraints are promoted into aioflo's public dependency metadata.
 - All 14 configured pre-commit hooks pass, including mypy 2.4.0. The cloud
   image lacked shellcheck; a local ShellCheck 0.11.0 binary completed the existing
   shellcheck hook. This validation binary is not an HA pin or a repository change.
-- Eleven aresponses deprecation warnings remain per run: asyncio.iscoroutinefunction
+- Twelve aresponses deprecation warnings remain per run after the review test
+  improvements (eleven in the initial candidate): asyncio.iscoroutinefunction
   is scheduled for removal in Python 3.16. A later Python support expansion needs
   revalidation or an independently justified mock-library update.
 
 This candidate requires independent review before being considered ready for a
 PR. No release version bump, PR, merge, deployment or device operation is part
 of this change.
+
+## Independent review follow-up
+
+The initial candidate was `3f27fe871b7ec47af982cb936327e33b28dc402f`.
+Independent review identified that the isolated mypy hook still resolved
+ast-serialize 0.13.1 despite HA explicitly pinning 0.12.1. Hook
+additional_dependencies now constrain ast-serialize 0.12.1 and librt 0.16.0,
+matching HA's test requirements alongside mypy 2.4.0. These are hook-environment
+constraints, not new aioflo runtime dependencies. Inspection of the rebuilt
+isolated hook environment confirms Python 3.14.10, mypy 2.4.0, ast-serialize
+0.12.1 and librt 0.16.0; the mypy hook and all 14 hooks pass.
+
+Review also exposed two pre-existing false-positive tests. The system mode test
+now registers the valid sleep-to-away request with an exact payload matcher,
+requires success, and verifies that all expected requests were matched in order.
+The legacy 401 test supplies repeatable 401 responses and explicitly asserts one
+request, then checks that no unexpected requests occurred. A missing mock can no
+longer satisfy the intended assertion by merely producing another RequestError.
+
+Three isolated production-code mutations fail the revised tests as expected:
+rejecting the valid away revert mode; sending home instead of away in the payload;
+and retrying the legacy 401 once. Mutation copies were outside the repository;
+no production changes are included. The unchanged implementation passes all
+51 tests on both Python 3.14.2 and 3.14.10 with 100% statement coverage.

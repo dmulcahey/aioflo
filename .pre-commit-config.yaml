@@ -49,6 +49,9 @@ repos:
     rev: v2.4.0
     hooks:
       - id: mypy
+        additional_dependencies:
+          - ast-serialize==0.12.1
+          - librt==0.16.0
         files: ^aioflo/.+\.py$
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

@@ -463,19 +463,27 @@ async def test_legacy_401_does_not_trigger_sso_reauth(
         "post",
         aresponses.Response(text=json.dumps(auth_success_response), status=200),
     )
-    # Exactly one 401 is registered: if the client retried, aresponses would raise for
-    # an unmatched second request rather than returning another 401.
+    calls = []
+
+    async def always_401(request):
+        calls.append(request.path)
+        return aresponses.Response(text=None, status=401)
+
     aresponses.add(
         "api-gw.meetflo.com",
         "/api/v2/thing",
         "get",
-        aresponses.Response(text=None, status=401),
+        always_401,
+        repeat=aresponses.INFINITY,
     )
 
     async with aiohttp.ClientSession() as session:
         api = await async_get_api(TEST_EMAIL_ADDRESS, TEST_PASSWORD, session=session)
         with pytest.raises(RequestError):
             await api._request("get", "https://api-gw.meetflo.com/api/v2/thing")
+
+    assert calls == ["/api/v2/thing"]
+    aresponses.assert_all_requests_matched()
 
 
 @pytest.mark.asyncio

@@ -123,7 +123,14 @@ async def test_system_modes(aresponses, auth_success_response):
         "post",
         aresponses.Response(text=None, status=204),
         body_pattern='{"target": "sleep", "revertMinutes": 120, "revertMode": "home"}',
-        repeat=2,
+    )
+
+    aresponses.add(
+        "api-gw.meetflo.com",
+        "/api/v2/locations/mmnnoopp/systemMode",
+        "post",
+        aresponses.Response(text=None, status=204),
+        body_pattern='{"target": "sleep", "revertMinutes": 120, "revertMode": "away"}',
     )
 
     async with aiohttp.ClientSession() as session:
@@ -148,5 +155,6 @@ async def test_system_modes(aresponses, auth_success_response):
                 TEST_LOCATION_ID, 120, revert_mode="sleep"
             )
 
-        with pytest.raises(RequestError):
-            await api.location.set_mode_sleep(TEST_LOCATION_ID, 120, revert_mode="away")
+        await api.location.set_mode_sleep(TEST_LOCATION_ID, 120, revert_mode="away")
+
+    aresponses.assert_plan_strictly_followed()
