@@ -1,8 +1,11 @@
 """Define fixtures available for all tests."""
 
+from collections.abc import AsyncIterator
 import time
 
+from aresponses import ResponsesMockServer
 import pytest
+import pytest_asyncio
 
 from .common import (
     TEST_EMAIL_ADDRESS,
@@ -59,3 +62,11 @@ def sso_refresh_success_response():
 def sso_users_me_response():
     """Define a response to /api/v2/users/me."""
     return {"id": TEST_USER_ID, "email": TEST_EMAIL_ADDRESS}
+
+
+@pytest_asyncio.fixture
+async def aresponses() -> AsyncIterator[ResponsesMockServer]:
+    """Run the mock server on pytest-asyncio's managed loop."""
+    # aresponses 2.x requests the event_loop fixture removed in pytest-asyncio 1.0.
+    async with ResponsesMockServer() as server:
+        yield server

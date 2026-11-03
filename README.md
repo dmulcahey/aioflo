@@ -195,6 +195,17 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+## Python support
+
+This development version requires Python 3.14.2 or newer, aligned with Home
+Assistant 2026.11.0b4. Python 3.11–3.13 are no longer supported. The development
+runtime is pinned to Python 3.14.10 in `.python-version`; CI tests both the minimum
+and that runtime. Consumers on older Python versions must remain on an earlier
+compatible aioflo release. aiohttp is pinned to the beta's version, 3.14.5.
+
+See [the dependency alignment report](docs/ha-beta-alignment.md) for the complete
+inventory, exceptions, and compatibility implications.
+
 ## Moen SSO (Cognito) auth
 
 The current Moen Smartwater app authenticates against Moen's SSO endpoint rather than the
