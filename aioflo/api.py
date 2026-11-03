@@ -192,7 +192,7 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
             async with session.request(method, url, **kwargs) as resp:
                 resp.raise_for_status()
                 return await resp.json(content_type=None)
-        except (ClientError, TimeoutError, JSONDecodeError) as err:
+        except (ClientError, TimeoutError, JSONDecodeError, UnicodeDecodeError) as err:
             raise RequestError(f"There was an error while requesting {url}") from err
         finally:
             if not use_running_session:

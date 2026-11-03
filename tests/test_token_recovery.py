@@ -4,12 +4,12 @@ import asyncio
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
-from aiohttp import ClientConnectionError, ClientResponseError
+from aiohttp import ClientConnectionError, ClientResponseError, ClientSession
 from multidict import CIMultiDict
 import pytest
 
 from aioflo.api import API, SSO_TOKEN_URL
-from aioflo.errors import RequestError
+from aioflo.errors import FloError, RequestError
 
 RESOURCE = "https://api-gw.meetflo.com/api/v2/test"
 
@@ -466,3 +466,38 @@ async def test_short_lived_sso_token_does_not_recurse(monkeypatch):
         datetime.now() < api._token_expiration < datetime.now() + timedelta(seconds=30)
     )
     assert send.await_count == 2
+
+
+@pytest.mark.parametrize("sso", [True, False])
+async def test_invalid_utf8_token_response_is_request_error(aresponses, sso):
+    """Wrap decoding failures without fallback, resource requests, or state changes."""
+    api = ready_api(sso)
+    api._token_expiration = datetime.now() - timedelta(seconds=1)
+    before = (api._token, api._refresh_token, api._token_expiration, api._user_id)
+    host, path = (
+        ("4j1gkf0vji.execute-api.us-east-2.amazonaws.com", "/prod/v1/oauth2/token")
+        if sso
+        else ("api.meetflo.com", "/api/v1/users/auth")
+    )
+    aresponses.add(
+        host,
+        path,
+        "post",
+        aresponses.Response(
+            body=b"\xff", status=200, headers={"Content-Type": "application/json"}
+        ),
+    )
+    async with ClientSession() as session:
+        api._session = session
+        with pytest.raises(RequestError) as raised:
+            await api._request("get", RESOURCE)
+        assert isinstance(raised.value, FloError)
+        assert isinstance(raised.value.__cause__, UnicodeDecodeError)
+        assert not session.closed
+    assert (
+        api._token,
+        api._refresh_token,
+        api._token_expiration,
+        api._user_id,
+    ) == before
+    aresponses.assert_plan_strictly_followed()
