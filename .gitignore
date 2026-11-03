@@ -9,3 +9,7 @@ coverage.xml
 poetry.lock
 tags
 .DS_Store
+
+# Disposable live timezone capture credentials and raw private responses:
+/capture/timezone_local.py
+/capture/output/
