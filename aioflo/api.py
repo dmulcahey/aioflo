@@ -1,11 +1,14 @@
 """Define a base client for interacting with Flo."""
 
+import asyncio
 from datetime import datetime, timedelta
+from json import JSONDecodeError
 import logging
 from urllib.parse import urlparse
 
 from aiohttp import ClientSession, ClientTimeout
-from aiohttp.client_exceptions import ClientError
+from aiohttp.client_exceptions import ClientError, ClientResponseError
+from multidict import CIMultiDict
 
 from .alarm import Alarm
 from .const import API_V2_BASE
@@ -61,13 +64,16 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
         :type use_sso: ``bool``
         """
         self._password: str = password
-        self._session: ClientSession = session
+        self._session: ClientSession | None = session
         self._token: str | None = None
         self._token_expiration: datetime | None = None
         self._refresh_token: str | None = None
         self._use_sso: bool = use_sso
         self._user_id: str | None = None
         self._username: str = username
+        self._auth_task: asyncio.Task | None = None
+        self._token_generation = 0
+        self._token_rejected = False
 
         self.alarm: Alarm = Alarm(self._request)
         self.location: Location = Location(self._request)
@@ -89,22 +95,69 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
         **kwargs,
     ) -> dict:
         """Make a request against the API."""
-        if self._token_expiration and datetime.now() >= self._token_expiration:
+        if _anonymous:
+            return await self._send_request(method, url, token=None, **kwargs)
+
+        await self._ensure_token()
+        for attempt in range(2):
+            token = self._token
+            generation = self._token_generation
+            try:
+                return await self._send_request(method, url, token=token, **kwargs)
+            except RequestError as err:
+                cause = err.__cause__
+                if not isinstance(cause, ClientResponseError) or cause.status != 401:
+                    raise
+                # A late response must not invalidate a newer token.
+                if generation == self._token_generation:
+                    self._token_rejected = True
+                if not _allow_reauth or attempt:
+                    raise
+                _LOGGER.info("Access token rejected; refreshing and retrying")
+                await self._ensure_token()
+        raise AssertionError("Unreachable")
+
+    async def _ensure_token(self) -> None:
+        """Share authentication, including callers arriving mid-refresh."""
+        if self._auth_task is not None and not self._auth_task.done():
+            await asyncio.shield(self._auth_task)
+        elif (
+            not self._token
+            or self._token_rejected
+            or not self._token_expiration
+            or datetime.now() >= self._token_expiration
+        ):
             _LOGGER.info("Requesting new access token to replace expired one")
+            await self._authenticate_shared()
 
-            # Nullify the token so that the authentication request doesn't use it:
-            self._token = None
+    async def _authenticate_shared(self, *, full_login: bool = False) -> None:
+        """Run one auth operation; cancelling a waiter does not cancel its peers."""
+        if self._auth_task is None or self._auth_task.done():
+            self._auth_task = asyncio.create_task(self._authenticate(full_login))
+            # Retrieve failures even if every waiter has been cancelled.
+            self._auth_task.add_done_callback(
+                lambda task: task.exception() if not task.cancelled() else None
+            )
+        await asyncio.shield(self._auth_task)
 
-            # Nullify the expiration so the authentication request doesn't get caught
-            # here:
-            self._token_expiration = None
-
-            if self._use_sso:
-                await self._async_refresh_sso()
+    async def _authenticate(self, full_login: bool) -> None:
+        """Publish one complete authentication generation."""
+        if self._use_sso:
+            if full_login:
+                await self._async_authenticate_sso()
             else:
-                await self.async_authenticate()
+                await self._async_refresh_sso()
+        else:
+            await self._async_authenticate_legacy()
+        self._token_generation += 1
+        self._token_rejected = False
 
-        kwargs.setdefault("headers", {})
+    async def _send_request(
+        self, method: str, url: str, *, token: str | None, **kwargs
+    ):
+        """Send once without entering authentication or mutating caller headers."""
+        kwargs["headers"] = CIMultiDict(kwargs.get("headers") or {})
+        kwargs["headers"].popall("Authorization", None)
         kwargs["headers"].update(
             {
                 "Accept": DEFAULT_HEADER_ACCEPT,
@@ -116,50 +169,38 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
             }
         )
 
-        if self._token and not _anonymous:
+        if token:
             kwargs["headers"]["Authorization"] = (
-                f"Bearer {self._token}" if self._use_sso else self._token
+                f"Bearer {token}" if self._use_sso else token
             )
 
-        use_running_session = self._session and not self._session.closed
+        # A borrowed session with default credentials cannot make an anonymous
+        # token request safely. Default BasicAuth also conflicts with token headers.
+        use_running_session = (
+            self._session
+            and not self._session.closed
+            and not self._session.auth
+            and not (token is None and "Authorization" in self._session.headers)
+        )
 
-        if use_running_session:
+        if use_running_session and self._session is not None:
             session = self._session
         else:
             session = ClientSession(timeout=ClientTimeout(total=DEFAULT_TIMEOUT))
 
         try:
             async with session.request(method, url, **kwargs) as resp:
-                # An SSO access token can be rejected before its nominal expiry (for
-                # example after a password change elsewhere). Refresh once and retry
-                # rather than surfacing a 401 to the caller.
-                if (
-                    resp.status == 401
-                    and self._use_sso
-                    and _allow_reauth
-                    and self._token is not None
-                ):
-                    _LOGGER.info("Access token rejected; refreshing and retrying")
-                else:
-                    resp.raise_for_status()
-                    data: dict = await resp.json(content_type=None)
-                    return data
-        except ClientError as err:
+                resp.raise_for_status()
+                return await resp.json(content_type=None)
+        except (ClientError, TimeoutError, JSONDecodeError) as err:
             raise RequestError(f"There was an error while requesting {url}") from err
         finally:
             if not use_running_session:
                 await session.close()
 
-        # Only reachable on a 401 from the SSO path:
-        await self._async_refresh_sso()
-        return await self._request(method, url, _allow_reauth=False, **kwargs)
-
     async def async_authenticate(self) -> None:
-        """Authenticate the user and set the access token with its expiration."""
-        if self._use_sso:
-            await self._async_authenticate_sso()
-        else:
-            await self._async_authenticate_legacy()
+        """Authenticate, sharing any authentication already in progress."""
+        await self._authenticate_shared(full_login=True)
 
     async def _async_authenticate_legacy(self) -> None:
         """Authenticate via the legacy Flo ``users/auth`` flow."""
@@ -167,18 +208,27 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
             "post",
             f"{API_V1_BASE}/users/auth",
             json={"username": self._username, "password": self._password},
+            _anonymous=True,
         )
 
-        self._token = auth_response["token"]
-        self._token_expiration = datetime.fromtimestamp(
-            auth_response["tokenPayload"]["timestamp"]
-            + auth_response["tokenExpiration"]
-        )
-
+        try:
+            token = auth_response["token"]
+            expiration = datetime.fromtimestamp(
+                auth_response["tokenPayload"]["timestamp"]
+                + auth_response["tokenExpiration"]
+            )
+            user_id = auth_response["tokenPayload"]["user"]["user_id"]
+            if not isinstance(token, str) or not token or not user_id:
+                raise ValueError("Missing token or user id")
+            if expiration <= datetime.now():
+                raise ValueError("Expired token")
+        except (KeyError, TypeError, ValueError, OverflowError, OSError) as err:
+            raise RequestError("Invalid legacy authentication response") from err
+        self._token = token
+        self._token_expiration = expiration
         if not self._user_id:
-            self._user_id = auth_response["tokenPayload"]["user"]["user_id"]
-            assert self._user_id
-            self.user = User(self._request, self._user_id)
+            self._user_id = user_id
+            self.user = User(self._request, user_id)
 
     async def _async_sso_token_request(self, payload: dict) -> dict:
         """Post to the SSO token endpoint and return the token object."""
@@ -190,35 +240,57 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
             _anonymous=True,
         )
         # The endpoint nests the token; tolerate a flat response too.
-        token: dict = response.get("token", response)
-        if "access_token" not in token:
-            raise RequestError("SSO login returned no access token")
+        if not isinstance(response, dict):
+            raise RequestError("Invalid SSO token response")
+        token = response.get("token", response)
+        if not isinstance(token, dict):
+            raise RequestError("Invalid SSO token response")
         return token
 
-    def _store_sso_token(self, token: dict) -> None:
-        """Record an SSO token and when it needs replacing."""
-        self._token = token["access_token"]
-        # A refresh-grant response may omit the refresh token; keep the existing one.
-        self._refresh_token = token.get("refresh_token", self._refresh_token)
-        self._token_expiration = datetime.now() + timedelta(
-            seconds=int(token.get("expires_in", 3600)) - SSO_EXPIRY_MARGIN
-        )
+    async def _store_sso_token(self, token: dict, *, full_login: bool = False) -> None:
+        """Validate all fields and user lookup before publishing credentials."""
+        try:
+            access_token = token["access_token"]
+            refresh_token = token.get(
+                "refresh_token", None if full_login else self._refresh_token
+            )
+            lifetime = int(token.get("expires_in", 3600))
+            if not isinstance(access_token, str) or not access_token or lifetime <= 0:
+                raise ValueError("Invalid access token or lifetime")
+            if refresh_token is not None and (
+                not isinstance(refresh_token, str) or not refresh_token
+            ):
+                raise ValueError("Invalid refresh token")
+            # Keep short-lived tokens usable without immediately refreshing again.
+            expiration = datetime.now() + timedelta(
+                seconds=lifetime - min(SSO_EXPIRY_MARGIN, lifetime / 2)
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as err:
+            raise RequestError("Invalid SSO token response") from err
+
+        user_id = self._user_id
+        if not user_id:
+            me = await self._send_request(
+                "get", f"{API_V2_BASE}/users/me", token=access_token
+            )
+            if not isinstance(me, dict) or not me.get("id"):
+                raise RequestError("SSO user response returned no user id")
+            user_id = me["id"]
+        if expiration <= datetime.now():
+            raise RequestError("SSO token expired during user lookup")
+        self._token = access_token
+        self._refresh_token = refresh_token
+        self._token_expiration = expiration
+        if not self._user_id:
+            self._user_id = user_id
+            self.user = User(self._request, user_id)
 
     async def _async_authenticate_sso(self) -> None:
         """Authenticate via the Moen SSO (Cognito) flow."""
         token = await self._async_sso_token_request(
             {"username": self._username, "password": self._password}
         )
-        self._store_sso_token(token)
-
-        if not self._user_id:
-            # Unlike the legacy token, the SSO token does not embed the user id.
-            me: dict = await self._request(
-                "get", f"{API_V2_BASE}/users/me", _allow_reauth=False
-            )
-            self._user_id = me["id"]
-            assert self._user_id
-            self.user = User(self._request, self._user_id)
+        await self._store_sso_token(token, full_login=True)
 
     async def _async_refresh_sso(self) -> None:
         """Exchange the refresh token, falling back to a full login."""
@@ -230,13 +302,20 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
             token = await self._async_sso_token_request(
                 {"grant_type": "refresh_token", "refresh_token": self._refresh_token}
             )
-        except RequestError:
+        except RequestError as err:
+            # Preserve the existing HTTP 400/401 fallback, but do not turn
+            # transport failures, rate limits, or server outages into logins.
+            cause = err.__cause__
+            if not isinstance(cause, ClientResponseError) or cause.status not in (
+                400,
+                401,
+            ):
+                raise
             _LOGGER.info("Refresh token rejected; falling back to a full login")
-            self._refresh_token = None
             await self._async_authenticate_sso()
             return
 
-        self._store_sso_token(token)
+        await self._store_sso_token(token)
 
 
 async def async_get_api(

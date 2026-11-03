@@ -453,32 +453,6 @@ async def test_sso_response_without_access_token_raises(aresponses):
 
 
 @pytest.mark.asyncio
-async def test_legacy_401_does_not_trigger_sso_reauth(
-    aresponses, auth_success_response
-):
-    """A 401 on the legacy path must surface, not route into the SSO refresh."""
-    aresponses.add(
-        "api.meetflo.com",
-        "/api/v1/users/auth",
-        "post",
-        aresponses.Response(text=json.dumps(auth_success_response), status=200),
-    )
-    # Exactly one 401 is registered: if the client retried, aresponses would raise for
-    # an unmatched second request rather than returning another 401.
-    aresponses.add(
-        "api-gw.meetflo.com",
-        "/api/v2/thing",
-        "get",
-        aresponses.Response(text=None, status=401),
-    )
-
-    async with aiohttp.ClientSession() as session:
-        api = await async_get_api(TEST_EMAIL_ADDRESS, TEST_PASSWORD, session=session)
-        with pytest.raises(RequestError):
-            await api._request("get", "https://api-gw.meetflo.com/api/v2/thing")
-
-
-@pytest.mark.asyncio
 async def test_sso_persistent_401_stops_after_one_retry(
     aresponses,
     sso_auth_success_response,

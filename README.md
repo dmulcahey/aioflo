@@ -206,5 +206,22 @@ back to a full login if the refresh token is rejected.
 api = await async_get_api("<EMAIL>", "<PASSWORD>", use_sso=True)
 ```
 
-The legacy flow is the default and is unchanged. The legacy endpoint still works, so this
-is cover for it being retired rather than a fix for a current failure.
+The legacy flow remains the default and sends its access token without a bearer prefix.
+Both flows recover missing or expired tokens before resource requests, and retry a
+resource `401` once after authentication. Concurrent requests share authentication;
+a delayed rejection of an older token reuses the newer token. Other resource errors
+are returned without an authentication retry.
+
+SSO refresh retains the existing full-login fallback for HTTP `400` and `401` responses.
+Transport failures, timeouts, rate limits, server errors, and malformed successful token
+responses surface as `RequestError` without falling back to password authentication.
+A later request can attempt recovery again. Credentials are replaced only after the
+complete token response (and initial SSO user lookup) succeeds.
+
+Cancelling a caller does not cancel authentication shared with other callers. The
+operation may finish after that caller exits. Sessions created by aioflo are closed
+when their individual HTTP request finishes; supplied sessions remain caller-owned.
+Keep a supplied session open until outstanding authentication has finished. Token
+requests omit authorization headers, including credentials in supplied header mappings
+or session defaults; a separate temporary session is used when session defaults would
+otherwise send credentials.
