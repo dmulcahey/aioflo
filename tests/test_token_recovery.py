@@ -389,6 +389,7 @@ async def test_auth_endpoint_rejection_never_recurses(monkeypatch, sso):
     [
         {},
         {"token": "", "tokenPayload": {}},
+        {**new_token(False), "token": ""},
         {
             "token": "new",
             "tokenPayload": {"timestamp": 0, "user": {"user_id": "user"}},
@@ -501,3 +502,216 @@ async def test_invalid_utf8_token_response_is_request_error(aresponses, sso):
         api._user_id,
     ) == before
     aresponses.assert_plan_strictly_followed()
+
+
+@pytest.mark.parametrize("sso", [True, False])
+@pytest.mark.parametrize("interleave", [False, True])
+async def test_staggered_failed_recovery(monkeypatch, sso, interleave):
+    """Late 401s share their first failed recovery, even across a fresh retry."""
+    api = ready_api(sso)
+    before = (api._token, api._refresh_token, api._token_expiration)
+    releases = [asyncio.Event() for _ in range(4)]
+    all_sent = asyncio.Event()
+    failure = http_error(503 if sso else 401)
+    auth_calls = 0
+    old_calls = 0
+
+    async def send(method, url, *, token, **kwargs):
+        nonlocal auth_calls, old_calls
+        if url != RESOURCE:
+            auth_calls += 1
+            assert token is None
+            if sso:
+                assert kwargs["json"]["grant_type"] == "refresh_token"
+            if auth_calls == 1:
+                raise failure
+            return new_token(sso)
+        if token == "old":
+            index = old_calls
+            old_calls += 1
+            if old_calls == 4:
+                all_sent.set()
+            await releases[index].wait()
+            raise http_error(401)
+        assert token == "new"
+        return {"ok": True}
+
+    monkeypatch.setattr(api, "_send_request", send)
+    async with asyncio.timeout(5):
+        tasks = [asyncio.create_task(api._request("get", RESOURCE)) for _ in releases]
+        try:
+            await all_sent.wait()
+            for index, (release, task) in enumerate(zip(releases, tasks)):
+                release.set()
+                with pytest.raises(RequestError) as raised:
+                    await task
+                assert raised.value is failure
+                if index == 0:
+                    assert auth_calls == 1
+                    assert (
+                        api._token,
+                        api._refresh_token,
+                        api._token_expiration,
+                    ) == before
+                    if interleave:
+                        assert await api._request("get", RESOURCE) == {"ok": True}
+            assert auth_calls == (2 if interleave else 1)
+            assert old_calls == 4
+            assert await api._request("get", RESOURCE) == {"ok": True}
+            assert auth_calls == 2
+            assert not api._token_rejected
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("bad", [[], {"token": []}])
+async def test_sso_non_object_response_is_atomic(monkeypatch, bad):
+    """Reject non-object token envelopes without replacing stored credentials."""
+    api = ready_api()
+    before = (api._token, api._refresh_token, api._token_expiration)
+    monkeypatch.setattr(api, "_send_request", AsyncMock(return_value=bad))
+    with pytest.raises(RequestError, match="Invalid SSO token response"):
+        await api.async_authenticate()
+    assert (api._token, api._refresh_token, api._token_expiration) == before
+
+
+@pytest.mark.parametrize("me", [[], {}, {"id": ""}])
+async def test_sso_missing_user_id_is_atomic(monkeypatch, me):
+    """A successful HTTP lookup without a user ID cannot publish credentials."""
+    api = API("username", "password", use_sso=True)
+    send = AsyncMock(side_effect=[new_token(True), me])
+    monkeypatch.setattr(api, "_send_request", send)
+    with pytest.raises(RequestError, match="no user id"):
+        await api.async_authenticate()
+    assert send.await_count == 2
+    assert api._token is api._refresh_token is api._token_expiration is api.user is None
+
+
+async def test_sso_token_expires_during_user_lookup(monkeypatch):
+    """A slow first user lookup cannot publish an already expired token."""
+    api = API("username", "password", use_sso=True)
+    now = datetime.now()
+
+    class Clock:
+        """Advance wall time deterministically during the lookup."""
+
+        @staticmethod
+        def now():
+            """Return the controlled time."""
+            return now
+
+    async def send(method, url, **kwargs):
+        nonlocal now
+        if url == SSO_TOKEN_URL:
+            return {"access_token": "new", "expires_in": 30}
+        now += timedelta(seconds=31)
+        return {"id": "user"}
+
+    monkeypatch.setattr("aioflo.api.datetime", Clock)
+    monkeypatch.setattr(api, "_send_request", send)
+    with pytest.raises(RequestError, match="expired during user lookup"):
+        await api.async_authenticate()
+    assert api._token is api._refresh_token is api._token_expiration is api.user is None
+
+
+@pytest.mark.parametrize("sso", [True, False])
+async def test_late_failure_does_not_join_new_recovery(monkeypatch, sso):
+    """Old responses retain their failure while a newer recovery is still running."""
+    api = ready_api(sso)
+    sent, late_release, entered, release = (asyncio.Event() for _ in range(4))
+    failure = http_error(503 if sso else 401)
+    auth_calls = 0
+    old_calls = 0
+
+    async def send(method, url, *, token, **kwargs):
+        nonlocal auth_calls, old_calls
+        if url != RESOURCE:
+            auth_calls += 1
+            if auth_calls == 1:
+                raise failure
+            entered.set()
+            await release.wait()
+            return new_token(sso)
+        if token == "old":
+            old_calls += 1
+            if old_calls == 2:
+                sent.set()
+                await late_release.wait()
+            else:
+                await sent.wait()
+            raise http_error(401)
+        return {"ok": True}
+
+    monkeypatch.setattr(api, "_send_request", send)
+    async with asyncio.timeout(5):
+        first = asyncio.create_task(api._request("get", RESOURCE))
+        late = asyncio.create_task(api._request("get", RESOURCE))
+        tasks = [first, late]
+        try:
+            with pytest.raises(RequestError) as raised:
+                await first
+            assert raised.value is failure
+            fresh = asyncio.create_task(api._request("get", RESOURCE))
+            tasks.append(fresh)
+            await entered.wait()
+            late_release.set()
+            with pytest.raises(RequestError) as raised:
+                await late
+            assert raised.value is failure
+            assert not fresh.done()
+            release.set()
+            assert await fresh == {"ok": True}
+            assert auth_calls == 2
+            assert not api._token_rejected
+        finally:
+            release.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_late_401_waiter_cancellation_preserves_recovery(monkeypatch):
+    """Cancelling a late 401 waiter does not cancel the recovery it joined."""
+    api = ready_api()
+    sent, entered, release, joined = (asyncio.Event() for _ in range(4))
+    old_calls = 0
+    auth_calls = 0
+
+    async def send(method, url, *, token, **kwargs):
+        nonlocal old_calls, auth_calls
+        if url != RESOURCE:
+            auth_calls += 1
+            entered.set()
+            await release.wait()
+            return new_token(True)
+        if token == "old":
+            old_calls += 1
+            if old_calls == 2:
+                sent.set()
+                await entered.wait()
+                joined.set()
+            else:
+                await sent.wait()
+            raise http_error(401)
+        return {"ok": True}
+
+    monkeypatch.setattr(api, "_send_request", send)
+    async with asyncio.timeout(5):
+        survivor = asyncio.create_task(api._request("get", RESOURCE))
+        cancelled = asyncio.create_task(api._request("get", RESOURCE))
+        try:
+            await joined.wait()
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+            assert not api._auth_task.done()
+            release.set()
+            assert await survivor == {"ok": True}
+            assert auth_calls == 1
+        finally:
+            release.set()
+            survivor.cancel()
+            cancelled.cancel()
+            await asyncio.gather(survivor, cancelled, return_exceptions=True)

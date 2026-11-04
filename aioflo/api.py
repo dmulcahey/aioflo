@@ -72,6 +72,7 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
         self._user_id: str | None = None
         self._username: str = username
         self._auth_task: asyncio.Task | None = None
+        self._next_auth: asyncio.Future[asyncio.Task] | None = None
         self._token_generation = 0
         self._token_rejected = False
 
@@ -99,7 +100,9 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
             return await self._send_request(method, url, token=None, **kwargs)
 
         await self._ensure_token()
-        for attempt in range(2):
+        retried = False
+        while True:
+            next_auth = self._next_auth
             token = self._token
             generation = self._token_generation
             try:
@@ -111,14 +114,20 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
                 # A late response must not invalidate a newer token.
                 if generation == self._token_generation:
                     self._token_rejected = True
-                if not _allow_reauth or attempt:
+                if not _allow_reauth or retried:
                     raise
                 _LOGGER.info("Access token rejected; refreshing and retrying")
+                # Keep the outcome of the first recovery after this request was sent,
+                # even if newer requests have since started another authentication.
+                if next_auth is not None and next_auth.done():
+                    await asyncio.shield(next_auth.result())
                 await self._ensure_token()
-        raise AssertionError("Unreachable")
+                retried = True
 
     async def _ensure_token(self, *, full_login: bool = False) -> None:
         """Share authentication, including callers arriving mid-refresh."""
+        if self._next_auth is None:
+            self._next_auth = asyncio.get_running_loop().create_future()
         if self._auth_task is None or self._auth_task.done():
             if (
                 not full_login
@@ -131,6 +140,8 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
             if not full_login:
                 _LOGGER.info("Requesting new access token to replace expired one")
             self._auth_task = asyncio.create_task(self._authenticate(full_login))
+            self._next_auth.set_result(self._auth_task)
+            self._next_auth = asyncio.get_running_loop().create_future()
             # Retrieve failures even if every waiter has been cancelled.
             self._auth_task.add_done_callback(
                 lambda task: task.exception() if not task.cancelled() else None
