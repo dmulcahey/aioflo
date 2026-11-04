@@ -13,7 +13,7 @@ from multidict import CIMultiDict
 from .alarm import Alarm
 from .const import API_V2_BASE
 from .device import Device
-from .errors import RequestError
+from .errors import CredentialsRejectedError, RequestError
 from .flodetect import Flodetect
 from .location import Location
 from .presence import Presence
@@ -198,7 +198,34 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
 
         try:
             async with session.request(method, url, **kwargs) as resp:
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except ClientResponseError as err:
+                    if (
+                        not self._use_sso
+                        and method.lower() == "post"
+                        and url == f"{API_V1_BASE}/users/auth"
+                        and err.status == 400
+                    ):
+                        try:
+                            data = await resp.json(content_type=None)
+                        except (
+                            ClientError,
+                            TimeoutError,
+                            JSONDecodeError,
+                            UnicodeDecodeError,
+                        ):
+                            pass
+                        else:
+                            if (
+                                isinstance(data, dict)
+                                and data.get("error") is True
+                                and data.get("message") == "Invalid username/password."
+                            ):
+                                raise CredentialsRejectedError(
+                                    "Legacy login credentials were rejected"
+                                ) from err
+                    raise
                 return await resp.json(content_type=None)
         except (ClientError, TimeoutError, JSONDecodeError, UnicodeDecodeError) as err:
             raise RequestError(f"There was an error while requesting {url}") from err
