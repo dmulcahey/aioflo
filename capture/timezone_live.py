@@ -3,12 +3,12 @@
 Python 3.11+: from the repository root:
     python -m venv .venv
     .venv/bin/python -m pip install -e .
-    cp capture/timezone_template.py capture/timezone_local.py
-Edit USERNAME, PASSWORD, LOCATION_ID, and TIMEZONE in timezone_local.py.
+Edit USERNAME, PASSWORD, LOCATION_ID, and TIMEZONE directly in
+capture/timezone_live.py (this runnable file is tracked in Git).
 Optionally set DEVICE_MAC and USE_SSO. Then:
-    .venv/bin/python -m capture.timezone_local
+    .venv/bin/python -m capture.timezone_live
 
-Only the ignored local copy may contain credentials. Delete it after capture.
+Do not commit your credential edits. Clear them after capture.
 JSON is written beneath ignored capture/output/ in a unique directory per run.
 Share that directory only after review: raw consumption bodies retain private
 location/device identifiers and water usage. No blanket anonymization is done.
@@ -209,13 +209,11 @@ async def capture_scenario(api, recorder, scenario, location_id, directory):
 
 
 async def main():
-    """Run only by explicitly executing the ignored credential-bearing copy."""
-    if Path(__file__).name != "timezone_local.py":
-        raise SystemExit(
-            "Copy to capture/timezone_local.py and edit that local file first."
-        )
+    """Run the tracked capture script explicitly after editing its placeholders."""
     if not all((USERNAME, PASSWORD, LOCATION_ID)):
-        raise SystemExit("Set USERNAME, PASSWORD and LOCATION_ID in the local copy.")
+        raise SystemExit(
+            "Set USERNAME, PASSWORD and LOCATION_ID in capture/timezone_live.py."
+        )
     logging.disable(logging.CRITICAL)
     zone = ZoneInfo(TIMEZONE)
     anchor = (

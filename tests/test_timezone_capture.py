@@ -9,7 +9,7 @@ from aiohttp import ClientResponseError
 import pytest
 
 from aioflo import async_get_api
-from capture.timezone_template import CaptureSession, capture_scenario, scenarios
+from capture.timezone_live import CaptureSession, capture_scenario, scenarios
 
 
 class FakeResponse:
@@ -135,12 +135,12 @@ async def test_transport_failure_still_writes_result(tmp_path):
 @pytest.mark.asyncio
 async def test_login_failure_writes_summary(tmp_path, monkeypatch):
     """Leave useful evidence even when login fails before scenario execution."""
-    from capture import timezone_template as capture
+    from capture import timezone_live as capture
 
     async def fail(*args, **kwargs):
         raise ValueError("SECRET auth response")
 
-    monkeypatch.setattr(capture, "__file__", str(tmp_path / "timezone_local.py"))
+    monkeypatch.setattr(capture, "__file__", str(tmp_path / "timezone_live.py"))
     monkeypatch.setattr(capture, "USERNAME", "SECRET_EMAIL")
     monkeypatch.setattr(capture, "PASSWORD", "SECRET_PASSWORD")
     monkeypatch.setattr(capture, "LOCATION_ID", "location")
@@ -153,3 +153,51 @@ async def test_login_failure_writes_summary(tmp_path, monkeypatch):
     assert record["setup_error_type"] == "ValueError"
     assert record["scenarios"] == []
     assert "SECRET" not in summaries[0].read_text()
+
+
+@pytest.mark.asyncio
+async def test_tracked_script_requires_placeholder_edits(monkeypatch):
+    """A fresh checkout runs directly and stops before login until configured."""
+    from capture import timezone_live as capture
+
+    monkeypatch.setattr(capture, "USERNAME", "")
+    monkeypatch.setattr(capture, "PASSWORD", "")
+    monkeypatch.setattr(capture, "LOCATION_ID", "")
+    with pytest.raises(SystemExit, match="in capture/timezone_live.py"):
+        await capture.main()
+
+
+@pytest.mark.asyncio
+async def test_tracked_script_complete_fake_run(tmp_path, monkeypatch):
+    """Execute every scenario with fake responses using the tracked filename."""
+    from capture import timezone_live as capture
+
+    auth = {
+        "token": "SECRET_TOKEN",
+        "tokenPayload": {"timestamp": 9999999999, "user": {"user_id": "user"}},
+        "tokenExpiration": 3600,
+    }
+    responses = [FakeResponse(json.dumps(auth))]
+    responses.extend(FakeResponse('{"items": []}') for _ in range(24))
+
+    @asynccontextmanager
+    async def session(**kwargs):
+        yield FakeSession(responses)
+
+    monkeypatch.setattr(capture, "__file__", str(tmp_path / "timezone_live.py"))
+    monkeypatch.setattr(capture, "USERNAME", "SECRET_EMAIL")
+    monkeypatch.setattr(capture, "PASSWORD", "SECRET_PASSWORD")
+    monkeypatch.setattr(capture, "LOCATION_ID", "location")
+    monkeypatch.setattr(capture, "DEVICE_MAC", "ab:cd")
+    monkeypatch.setattr(capture, "ANCHOR_DATE", "2026-11-02")
+    monkeypatch.setattr(capture, "TIMEZONE", "America/Denver")
+    monkeypatch.setattr(capture, "ClientSession", session)
+    monkeypatch.setattr(capture.logging, "disable", lambda level: None)
+    assert await capture.main() == 0
+    summary_path = next((tmp_path / "output").glob("*/summary.json"))
+    summary = json.loads(summary_path.read_text())
+    assert len(summary["scenarios"]) == 24
+    assert all(item["outcome"] == "success" for item in summary["scenarios"])
+    assert len(list(summary_path.parent.glob("*.json"))) == 25
+    for path in summary_path.parent.glob("*.json"):
+        assert "SECRET" not in path.read_text()

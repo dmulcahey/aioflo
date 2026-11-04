@@ -10,6 +10,5 @@ poetry.lock
 tags
 .DS_Store
 
-# Disposable live timezone capture credentials and raw private responses:
-/capture/timezone_local.py
+# Generated private live timezone capture responses (source stays tracked):
 /capture/output/
