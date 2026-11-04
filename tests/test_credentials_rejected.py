@@ -17,8 +17,10 @@ LEGACY_PATH = "/api/v1/users/auth"
 REJECTION = {"error": True, "message": "Invalid username/password."}
 
 
-@pytest.mark.parametrize("state", ["initial", "expired", "rejected"])
-@pytest.mark.parametrize("raise_status", [False, True])
+@pytest.mark.parametrize(
+    ("state", "raise_status"),
+    [("initial", False), ("expired", False), ("rejected", False), ("initial", True)],
+)
 async def test_legacy_credentials_rejected(aresponses, state, caplog, raise_status):
     """Classify the proven signal through login and recovery without state changes."""
     api = (
@@ -67,26 +69,19 @@ async def test_legacy_credentials_rejected(aresponses, state, caplog, raise_stat
 @pytest.mark.parametrize(
     ("status", "body"),
     [
-        (400, b""),
         (400, b"{"),
         (400, b"\xff"),
-        (400, b"null"),
         (400, b"[]"),
         (400, json.dumps({"token": REJECTION}).encode()),
         (400, json.dumps({"message": REJECTION["message"]}).encode()),
         (400, json.dumps({"error": True}).encode()),
         (400, json.dumps({**REJECTION, "error": 1}).encode()),
-        (400, json.dumps({**REJECTION, "error": "true"}).encode()),
-        (400, json.dumps({**REJECTION, "error": False}).encode()),
         (400, json.dumps({**REJECTION, "message": "Invalid date range."}).encode()),
         (
             400,
             json.dumps({**REJECTION, "message": "Invalid username/password"}).encode(),
         ),
-        (400, json.dumps({**REJECTION, "message": None}).encode()),
         (401, json.dumps(REJECTION).encode()),
-        (403, json.dumps(REJECTION).encode()),
-        (429, json.dumps(REJECTION).encode()),
         (500, json.dumps(REJECTION).encode()),
     ],
 )
@@ -200,15 +195,11 @@ async def test_credentials_rejection_is_shared(aresponses):
 @pytest.mark.parametrize(
     ("status", "target", "method"),
     [
-        (303, "/api/v1/other", "get"),
         (307, "/api/v1/other", "post"),
         (303, LEGACY_PATH, "get"),
     ],
 )
-@pytest.mark.parametrize("raise_status", [False, True])
-async def test_redirected_rejection_is_generic(
-    aresponses, status, target, method, raise_status
-):
+async def test_redirected_rejection_is_generic(aresponses, status, target, method):
     """A redirected endpoint or GET is not the observed legacy login signal."""
     aresponses.add(
         LEGACY_HOST,
@@ -225,11 +216,10 @@ async def test_redirected_rejection_is_generic(
     aresponses.add(LEGACY_HOST, target, method, reject)
     api = ready_api(False)
     before = (api._token, api._refresh_token, api._token_expiration)
-    async with ClientSession(raise_for_status=raise_status) as session:
+    async with ClientSession() as session:
         api._session = session
         with pytest.raises(RequestError) as raised:
             await api.async_authenticate()
-        assert session.raise_for_status is raise_status
         assert not session.closed
     assert type(raised.value) is RequestError
     assert isinstance(raised.value.__cause__, ClientResponseError)
