@@ -18,7 +18,8 @@ REJECTION = {"error": True, "message": "Invalid username/password."}
 
 
 @pytest.mark.parametrize("state", ["initial", "expired", "rejected"])
-async def test_legacy_credentials_rejected(aresponses, state, caplog):
+@pytest.mark.parametrize("raise_status", [False, True])
+async def test_legacy_credentials_rejected(aresponses, state, caplog, raise_status):
     """Classify the proven signal through login and recovery without state changes."""
     api = (
         API("synthetic-user", "synthetic-password")
@@ -41,10 +42,11 @@ async def test_legacy_credentials_rejected(aresponses, state, caplog):
         "post",
         aresponses.Response(text=json.dumps(REJECTION), status=400),
     )
-    async with ClientSession() as session:
+    async with ClientSession(raise_for_status=raise_status) as session:
         api._session = session
         with pytest.raises(RequestError) as raised:
             await api._request("get", "https://api-gw.meetflo.com/api/v2/test")
+        assert session.raise_for_status is raise_status
         assert type(raised.value) is CredentialsRejectedError
         assert isinstance(raised.value.__cause__, ClientResponseError)
         assert raised.value.__cause__.status == 400
@@ -192,4 +194,72 @@ async def test_credentials_rejection_is_shared(aresponses):
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
     assert (api._token, api._refresh_token, api._token_expiration) == before
+    aresponses.assert_plan_strictly_followed()
+
+
+@pytest.mark.parametrize(
+    ("status", "target", "method"),
+    [
+        (303, "/api/v1/other", "get"),
+        (307, "/api/v1/other", "post"),
+        (303, LEGACY_PATH, "get"),
+    ],
+)
+@pytest.mark.parametrize("raise_status", [False, True])
+async def test_redirected_rejection_is_generic(
+    aresponses, status, target, method, raise_status
+):
+    """A redirected endpoint or GET is not the observed legacy login signal."""
+    aresponses.add(
+        LEGACY_HOST,
+        LEGACY_PATH,
+        "post",
+        aresponses.Response(status=status, headers={"Location": target}),
+    )
+
+    async def reject(request):
+        assert request.method.lower() == method
+        assert request.path == target
+        return aresponses.Response(text=json.dumps(REJECTION), status=400)
+
+    aresponses.add(LEGACY_HOST, target, method, reject)
+    api = ready_api(False)
+    before = (api._token, api._refresh_token, api._token_expiration)
+    async with ClientSession(raise_for_status=raise_status) as session:
+        api._session = session
+        with pytest.raises(RequestError) as raised:
+            await api.async_authenticate()
+        assert session.raise_for_status is raise_status
+        assert not session.closed
+    assert type(raised.value) is RequestError
+    assert isinstance(raised.value.__cause__, ClientResponseError)
+    assert raised.value.__cause__.status == 400
+    assert str(raised.value.__cause__.request_info.real_url).endswith(target)
+    assert (api._token, api._refresh_token, api._token_expiration) == before
+    aresponses.assert_plan_strictly_followed()
+
+
+async def test_resource_keeps_session_status_handler(aresponses):
+    """Legacy classification must not override status handling for other requests."""
+    checked = []
+
+    async def check_status(response):
+        checked.append(str(response.url))
+        response.raise_for_status()
+
+    aresponses.add(
+        "api-gw.meetflo.com",
+        "/api/v2/test",
+        "get",
+        aresponses.Response(text=json.dumps(REJECTION), status=400),
+    )
+    api = ready_api(False)
+    async with ClientSession(raise_for_status=check_status) as session:
+        api._session = session
+        with pytest.raises(RequestError) as raised:
+            await api._request("get", "https://api-gw.meetflo.com/api/v2/test")
+        assert session.raise_for_status is check_status
+    assert type(raised.value) is RequestError
+    assert raised.value.__cause__.status == 400
+    assert checked == ["https://api-gw.meetflo.com/api/v2/test"]
     aresponses.assert_plan_strictly_followed()

@@ -196,15 +196,24 @@ class API:  # pylint: disable=too-few-public-methods,too-many-instance-attribute
         else:
             session = ClientSession(timeout=ClientTimeout(total=DEFAULT_TIMEOUT))
 
+        legacy_login = (
+            not self._use_sso
+            and method.lower() == "post"
+            and url == f"{API_V1_BASE}/users/auth"
+        )
+        if legacy_login:
+            # Inspect the rejection body before a supplied session raises on status.
+            kwargs["raise_for_status"] = False
+
         try:
             async with session.request(method, url, **kwargs) as resp:
                 try:
                     resp.raise_for_status()
                 except ClientResponseError as err:
                     if (
-                        not self._use_sso
-                        and method.lower() == "post"
-                        and url == f"{API_V1_BASE}/users/auth"
+                        legacy_login
+                        and resp.method == "POST"
+                        and str(resp.url) == f"{API_V1_BASE}/users/auth"
                         and err.status == 400
                     ):
                         try:
